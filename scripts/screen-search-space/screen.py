@@ -388,6 +388,9 @@ if __name__ == '__main__':
     # Store the run parameters
     with open(out_path / 'run-config.json', 'w') as fp:
         json.dumps(run_params, indent=2)
+    with open(out_path / 'to-compare.smi', 'w') as fp:
+        for s in to_compare:
+            print(s, file=fp)
     
     # Set up the logging
     handlers = [logging.FileHandler(out_path / 'runtime.log', mode='w'), logging.StreamHandler(sys.stdout)]
