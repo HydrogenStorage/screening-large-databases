@@ -1,0 +1,31 @@
+name: cfree
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  # Core dependencies
+  - python==3.9.*
+  - scikit-learn>=1
+  - redis==5.0.3
+  - redis-py==3.4.*
+  - jupyterlab
+  - pytest
+  - flake8
+  - pip
+
+# Dependencies from the molecular design app
+  - openbabel==3.1.1
+  - geometric==0.9.*
+  - qcengine==0.18.*
+  - rdkit==2021.09.4
+  - py-cpuinfo<6
+  - psutil
+  - tqdm
+
+# Pip packages for all of them
+  - pip:
+#      - -e . 
+      - parsl[monitoring]>=1.*
+      - pydantic
+      - git+https://github.com/exalearn/colmena.git
+      - git+https://github.com/qmlcode/qml.git@develop
