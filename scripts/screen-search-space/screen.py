@@ -42,7 +42,7 @@ def parsl_config(name: str) -> Tuple[Config, int]:
         ), 64
     elif name == 'theta-debug':
         return Config(
-            retries=16,
+            retries=2,
             executors=[HighThroughputExecutor(
                     address=address_by_hostname(),
                     label="debug",
@@ -58,10 +58,10 @@ def parsl_config(name: str) -> Tuple[Config, int]:
                         init_blocks=0,
                         max_blocks=1,
                         cmd_timeout=360,
-                        launcher=AprunLauncher(overrides='-d 64 --cc depth -j 1'),
+                        launcher=AprunLauncher(overrides='-d 64 --cc depth -j 2'),
                         worker_init='''
 module load miniconda-3
-conda activate /lus/theta-fs0/projects/CSC249ADCD08/edw/env''',
+conda activate /lus/theta-fs0/projects/CSC249ADCD08/carbon-free-ldrd/env''',
                     ),
                 )]
             ), 64 * 8 * 4
@@ -180,7 +180,8 @@ class ScreenEngine(BaseThinker):
 
             # Submit once we have resources available
             self.rec.acquire("screen", 1)
-            self.queues.send_inputs(chunk, self.current_threshold, method='screen_molecules', task_info={'key': key})
+            self.queues.send_inputs(chunk, self.current_threshold, method='screen_molecules',
+                                    task_info={'key': key, 'threshold': self.current_threshold})
 
     @agent(startup=True)
     def receive_results(self):
@@ -190,7 +191,7 @@ class ScreenEngine(BaseThinker):
         start_time = np.inf  # Use the time the first compute starts
         num_recorded = 0
         with open(self.output_dir / 'inference-results.json', 'w') as fq:
-            while True:
+            while not self.done.is_set():
                 # Stop when all have been recorded
                 if self.all_read.is_set() and num_recorded >= self.total_chunks:
                     break
@@ -217,9 +218,9 @@ class ScreenEngine(BaseThinker):
 
                 # Print a status message
                 if self.all_read.is_set():
-                    self.logger.info(f'Recorded task {num_recorded}/{self.total_chunks}. Processing backlog: {self.result_queue.qsize()}')
+                    self.logger.info(f'Received task {num_recorded}/{self.total_chunks}. Processing backlog: {self.result_queue.qsize()}')
                 else:
-                    self.logger.info(f'Recorded task {num_recorded}/???. Processing backlog: {self.result_queue.qsize()}')
+                    self.logger.info(f'Received task {num_recorded}/???. Processing backlog: {self.result_queue.qsize()}')
 
         # Send a "done" message
         self.result_queue.put(None)
@@ -265,10 +266,11 @@ class ScreenEngine(BaseThinker):
                 self.current_threshold = self.best_mols[0].priority
 
             # Print a status message
+            status = f'Number received: {len(result)}. New threshold: {self.current_threshold:.4f}'
             if self.all_read.is_set():
-                self.logger.info(f'Recorded task {count}/{self.total_chunks}. Current threshold: {self.current_threshold:.4f}')
+                self.logger.info(f'Processed task {count}/{self.total_chunks}. {status}')
             else:
-                self.logger.info(f'Recorded task {count}/???. Current threshold: {self.current_threshold:.4f}')
+                self.logger.info(f'Processed task {count}/???. {status}')
 
         # Write the data out to disk
         self.logger.info(f'Completed processing all results. Output list size: {len(self.best_mols)}')
