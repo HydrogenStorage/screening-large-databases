@@ -11,6 +11,7 @@ from datetime import datetime
 import argparse
 import logging
 import heapq
+import gzip
 import json
 
 from colmena.redis.queue import make_queue_pairs, ClientQueues
@@ -28,7 +29,7 @@ def parsl_config(name: str) -> Tuple[Config, int]:
     """Make the compute resource configuration
 
     Args:
-        name: Name of the diesred configuration
+        name: Name of the desired configuration
     Returns:
         - Parsl compute configuration
         - Number of compute slots: Includes execution slots and pre-fetch buffers
@@ -64,7 +65,7 @@ module load miniconda-3
 conda activate /lus/theta-fs0/projects/CSC249ADCD08/carbon-free-ldrd/env''',
                     ),
                 )]
-            ), 64 * 8 * 4
+            ), 64 * 8 * 2
     else:
         raise ValueError(f'Configuration not defined: {name}')
 
@@ -123,6 +124,9 @@ class ScreenEngine(BaseThinker):
         self.all_read = Event()
         self.total_chunks = 0
         self.total_molecules = 0
+        
+        # Recording for performance information
+        self.start_time = np.inf  # Use the time the first compute starts
 
     @agent(startup=True)
     def read_chunks(self):
@@ -188,9 +192,8 @@ class ScreenEngine(BaseThinker):
         """Mark results complete"""
 
         # Open the output file
-        start_time = np.inf  # Use the time the first compute starts
         num_recorded = 0
-        with open(self.output_dir / 'inference-results.json', 'w') as fq:
+        with gzip.open(self.output_dir / 'inference-results.json.gz', 'wt') as fq:
             while not self.done.is_set():
                 # Stop when all have been recorded
                 if self.all_read.is_set() and num_recorded >= self.total_chunks:
@@ -208,7 +211,7 @@ class ScreenEngine(BaseThinker):
                 num_recorded += 1
                     
                 # Update the start time
-                start_time = min(start_time, result.time_compute_started)
+                self.start_time = min(self.start_time, result.time_compute_started)
                 
                 # Remove the chunk from the proxystore
                 self.store.evict(result.task_info['key'])
@@ -226,7 +229,7 @@ class ScreenEngine(BaseThinker):
         self.result_queue.put(None)
 
         # Print the final status
-        run_time = datetime.now().timestamp() - start_time
+        run_time = datetime.now().timestamp() - self.start_time
         self.logger.info(f'Runtime {run_time:.2f} s. Evaluation rate: {self.total_molecules / run_time:.3e} mol/s')
 
     @agent()
@@ -273,17 +276,23 @@ class ScreenEngine(BaseThinker):
                 self.logger.info(f'Processed task {count}/???. {status}')
 
         # Write the data out to disk
-        self.logger.info(f'Completed processing all results. Output list size: {len(self.best_mols)}')
+        self.logger.info(f'Completed processing all results. Output list size: {len(self.best_mols)}. Sorting results now')
+        
+        self.best_mols.sort(reverse=True)
+        self.logger.info('Finished sorting. Writing to disk')
 
-        with open(self.output_dir / 'best_molecules.csv', 'w') as fp:
-            writer = DictWriter(fp, ['smiles', 'inchi', 'score'])
+        with gzip.open(self.output_dir / 'best_molecules.csv.gz', 'wt') as fp:
+            writer = DictWriter(fp, ['smiles', 'inchi', 'score', 'similarities'])
             writer.writeheader()
-            for record in sorted(self.best_mols, reverse=True):
+            for record in self.best_mols:
                 entry = json.loads(record.item)
                 entry['score'] = record.priority
                 writer.writerow(entry)
-
         self.logger.info('Finished writing results to disk')
+        
+        # Write out the total run time.
+        run_time = datetime.now().timestamp() - self.start_time
+        self.logger.info(f'Runtime {run_time:.2f} s. Overall evaluation rate: {self.total_molecules / run_time:.3e} mol/s')
 
 
 def screen_molecules(to_screen: List[str], min_similarity: float, to_compare: Tuple[str], radius: int = 4) -> List[Tuple[float, str]]:
@@ -335,14 +344,22 @@ def screen_molecules(to_screen: List[str], min_similarity: float, to_compare: Tu
         fp = AllChem.GetMorganFingerprint(mol, radius)
 
         # Compute the maximum similarity to the comparison set
-        mol_similarity = max(DataStructs.BulkTanimotoSimilarity(fp, compare_mols))
+        mol_similarity = DataStructs.BulkTanimotoSimilarity(fp, compare_mols)
+        max_similarity = max(mol_similarity)
+        
+        # If it is an exact match, skip it
+        if max_similarity == 1.0:
+            continue
 
         # If it doesn't meet the threshold, don't return it
-        if mol_similarity < min_similarity:
+        if max_similarity < min_similarity:
             continue
 
         # If not, add it to the output dictionary
-        passed.append((mol_similarity, json.dumps({'smiles': smiles, 'inchi': Chem.MolToInchi(mol)})))
+        passed.append((max_similarity, json.dumps({
+            'smiles': smiles, 'inchi': Chem.MolToInchi(mol),
+            'similarities': json.dumps(mol_similarity)
+        })))
 
     return passed
 
@@ -387,7 +404,7 @@ if __name__ == '__main__':
     
     # Store the run parameters
     with open(out_path / 'run-config.json', 'w') as fp:
-        json.dumps(run_params, indent=2)
+        json.dump(run_params, fp, indent=2)
     with open(out_path / 'to-compare.smi', 'w') as fp:
         for s in to_compare:
             print(s, file=fp)
