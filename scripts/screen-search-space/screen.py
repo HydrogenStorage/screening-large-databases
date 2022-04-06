@@ -93,7 +93,7 @@ class ScreenEngine(BaseThinker):
     def __init__(self,
                  queues: ClientQueues,
                  store: ps.store.remote.RemoteStore,
-                 screen_path: Path,
+                 screen_paths: List[Path],
                  target_count: int,
                  output_dir: Path,
                  slot_count: int,
@@ -104,7 +104,7 @@ class ScreenEngine(BaseThinker):
         self.rec.reallocate(None, 'screen', 'all')
 
         # Store the input and output information
-        self.screen_path = screen_path
+        self.screen_paths = screen_paths
         self.output_dir = output_dir
         self.chunk_size = chunk_size
         self.target_count = target_count
@@ -143,22 +143,31 @@ class ScreenEngine(BaseThinker):
             
             # Put the proxy and the key in the queue
             self.screen_queue.put((chunk_proxy, key))
+            
+        # Loop over all files
+        for i, path in enumerate(self.screen_paths): 
+            self.logger.info(f'Reading from file {i+1}/{len(self.screen_paths)}: {path}')
+            with path.open() as fp:
+                chunk = []
+                for line in fp:
+                    try:
+                        if path.suffix == '.csv':
+                            # The line is comma-separated with the last entry as the string
+                            _, smiles = line.strip().rsplit(",", 1)
+                        elif path.suffix == '.smi':
+                            # The line is just a SMILES string
+                            smiles = line.strip() 
+                        else:
+                            raise ValueError(f'Extension "{path.suffix}" not recognized for "')
+                    except:
+                        continue
+                    self.total_molecules += 1
 
-        with self.screen_path.open() as fp:
-            chunk = []
-            for line in fp:
-                try:
-                    # The line is comma-separated with the last entry as the string
-                    _, smiles = line.strip().rsplit(",", 1)
-                except:
-                    continue
-                self.total_molecules += 1
-
-                # Add to the chunk and submit if we hit the target size
-                chunk.append(smiles)
-                if len(chunk) >= self.chunk_size:
-                    _proxy_and_push(chunk)
-                    chunk = []
+                    # Add to the chunk and submit if we hit the target size
+                    chunk.append(smiles)
+                    if len(chunk) >= self.chunk_size:
+                        _proxy_and_push(chunk)
+                        chunk = []
                     
         # Submit whatever remains
         _proxy_and_push(chunk)
@@ -309,6 +318,13 @@ def screen_molecules(to_screen: List[str], min_similarity: float, to_compare: Tu
     import json
     from rdkit import Chem
     from rdkit.Chem import DataStructs, AllChem
+    
+    # Turn off logging
+    import rdkit.rdBase as rkrb
+    import rdkit.RDLogger as rkl
+    logger = rkl.logger()
+    logger.setLevel(rkl.ERROR)
+    rkrb.DisableLog('rdApp.error')
 
     # Check if we have already parsed the comparison set
     my_globals = globals()
@@ -378,7 +394,8 @@ if __name__ == '__main__':
     group.add_argument('--overwrite', action='store_true', help='Whether to overwrite a previous run')
 
     group = parser.add_argument_group(title='Search Coonfiguration', description='How we screen for the top molecules')
-    group.add_argument('--search-space', help='Path to molecules to be screened', required=True)
+    group.add_argument('--search-space', nargs='+', help='Path to molecules to be screened', required=True)
+    group.add_argument('--name', help='Name for the screening selection')
     group.add_argument('--num-top', default=1000000, type=int, help='Number of most-similar molecules to find')
     group.add_argument('--comparison-molecules', required=True, help='Path to the molecule(s) to compare against. Must be line-delimited SMILES')
     group.add_argument('--radius', default=4, type=int, help='Radius of the fingerprint')
@@ -388,8 +405,8 @@ if __name__ == '__main__':
     run_params = args.__dict__
 
     # Check that the search path exists
-    search_path = Path(args.search_space)
-    assert search_path.is_file()
+    search_paths = [Path(x) for x in args.search_space]
+    assert all(x.is_file() for x in search_paths)
 
     # Load in the molecules to be screened
     with open(args.comparison_molecules) as fp:
@@ -399,7 +416,8 @@ if __name__ == '__main__':
     run_hash = sha256()
     run_hash.update(str(run_params).encode())
     run_hash.update(str(to_compare).encode())
-    out_path = Path().joinpath('runs', f'{search_path.name[:-4]}-top{args.num_top}-{run_hash.hexdigest()[:6]}')
+    name = args.name if args.name is not None else search_paths[0].name[:-4]
+    out_path = Path().joinpath('runs', f'{name}-top{args.num_top}-{run_hash.hexdigest()[:6]}')
     out_path.mkdir(parents=True, exist_ok=args.overwrite)
     
     # Store the run parameters
@@ -427,7 +445,7 @@ if __name__ == '__main__':
                         level=logging.INFO, handlers=handlers)
 
     # Log the run information
-    logging.info(f'Finding the {args.num_top} molecules from {search_path} closest to {len(to_compare)} molecules. Saving to {out_path}')
+    logging.info(f'Finding the {args.num_top} molecules that are closest to {len(to_compare)} examples out of {len(search_paths)} files. Saving to {out_path}')
 
     # Prepare the screening function
     screen_fun = partial(screen_molecules, to_compare=tuple(to_compare), radius=args.radius)
@@ -452,7 +470,7 @@ if __name__ == '__main__':
     task_server = ParslTaskServer([screen_fun], server_q, config)
 
     # Make the thinker
-    thinker = ScreenEngine(client_q, store, search_path, args.num_top, out_path, n_slots, args.molecules_per_chunk)
+    thinker = ScreenEngine(client_q, store, search_paths, args.num_top, out_path, n_slots, args.molecules_per_chunk)
 
     # Run the program
     try:
