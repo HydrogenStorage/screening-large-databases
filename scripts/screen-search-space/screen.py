@@ -66,6 +66,34 @@ conda activate /lus/theta-fs0/projects/CSC249ADCD08/carbon-free-ldrd/env''',
                     ),
                 )]
             ), 64 * 8 * 2
+    elif name == 'theta-full':
+        return Config(
+            retries=2,
+            executors=[HighThroughputExecutor(
+                    address=address_by_hostname(),
+                    label="full",
+                    max_workers=64,
+                    prefetch_capacity=192,
+                    cpu_affinity='block',
+                    provider=CobaltProvider(
+                        account='CSC249ADCD08',
+                        nodes_per_block=512,
+                        scheduler_options='#COBALT --attrs enable_ssh=1',
+                        walltime='09:00:00',
+                        init_blocks=0,
+                        max_blocks=1,
+                        cmd_timeout=360,
+                        launcher=AprunLauncher(overrides='-d 64 --cc depth -j 2'),
+                        worker_init=f'''
+module load miniconda-3
+conda activate /lus/eagle/projects/ExaLearn/carbon-free-ldrd/env
+export PYTHONPATH="$PYTHONPATH:{Path(__file__).parent}"
+pwd 
+which python
+''',
+                    ),
+                )]
+            ), 512 * 64 * 5
     else:
         raise ValueError(f'Configuration not defined: {name}')
 
@@ -111,7 +139,8 @@ class ScreenEngine(BaseThinker):
         self.store = store
 
         # Queue to store ready-to-compute chunks
-        self.screen_queue = Queue(slot_count * 2)
+        self.queue_depth = slot_count * 32
+        self.screen_queue = Queue(self.queue_depth)
 
         # Queue to store results ready to add to the list
         self.result_queue = Queue()
@@ -122,6 +151,7 @@ class ScreenEngine(BaseThinker):
 
         # Things to know if we are done
         self.all_read = Event()
+        self.queue_filled = Event()
         self.total_chunks = 0
         self.total_molecules = 0
         
@@ -143,6 +173,11 @@ class ScreenEngine(BaseThinker):
             
             # Put the proxy and the key in the queue
             self.screen_queue.put((chunk_proxy, key))
+            
+            # Mark that the queue is completely filled
+            if self.total_chunks == self.queue_depth:
+                self.logger.info('Queue is filled. Submit tasks now!')
+                self.queue_filled.set()
             
         # Loop over all files
         for i, path in enumerate(self.screen_paths): 
@@ -173,6 +208,7 @@ class ScreenEngine(BaseThinker):
         _proxy_and_push(chunk)
 
         # Put a None at the end to signal we are done
+        self.queue_filled.set()  # Make sure the task submitter starts
         self.screen_queue.put(None)
 
         # Mark that we are done reading
@@ -182,6 +218,11 @@ class ScreenEngine(BaseThinker):
     @agent(startup=True)
     def submit_task(self):
         """Submit chunks of molecules to be screened"""
+        
+        # Wait until the queue is filled
+        self.queue_filled.wait()
+        self.logger.info('Starting to submit tasks.')
+        
         while True:
             # Get the next chunk and, if None, break
             msg = self.screen_queue.get()
@@ -239,7 +280,7 @@ class ScreenEngine(BaseThinker):
 
         # Print the final status
         run_time = datetime.now().timestamp() - self.start_time
-        self.logger.info(f'Runtime {run_time:.2f} s. Evaluation rate: {self.total_molecules / run_time:.3e} mol/s')
+        self.logger.info(f'Completed storing all results. {run_time:.2f} s. Overall evaluation rate: {self.total_molecules / run_time:.3e} mol/s')
 
     @agent()
     def store_results(self):
