@@ -4,10 +4,11 @@ from functools import partial, update_wrapper
 from hashlib import sha256
 from queue import Queue
 from threading import Event
-from typing import List, Tuple
+from typing import List, Tuple, Union
 from pathlib import Path
 from csv import DictWriter
 from datetime import datetime
+from glob import glob
 import argparse
 import logging
 import heapq
@@ -111,11 +112,12 @@ class ScreenEngine(BaseThinker):
 
     Parameters:
         queues: List of queues
-        screen_path: Path to molecules to be screened
+        screen_paths: Path to molecules to be screened
         store: Store used to pass inputs from thinker to worker
         output_dir: Path to the output directory
         slot_count: Number of execution slots
         chunk_size: Number of molecules per chunk
+        read_on_nodes: Whether to read files on computes nodes rather than main
     """
 
     def __init__(self,
@@ -125,13 +127,15 @@ class ScreenEngine(BaseThinker):
                  target_count: int,
                  output_dir: Path,
                  slot_count: int,
-                 chunk_size: int
+                 chunk_size: int,
+                 read_on_nodes: bool
                  ):
         # Init the base class
         super().__init__(queues, ResourceCounter(slot_count, ['screen']))
         self.rec.reallocate(None, 'screen', 'all')
 
         # Store the input and output information
+        self.read_on_nodes = read_on_nodes
         self.screen_paths = screen_paths
         self.output_dir = output_dir
         self.chunk_size = chunk_size
@@ -183,29 +187,47 @@ class ScreenEngine(BaseThinker):
         chunk = []
         for i, path in enumerate(self.screen_paths): 
             self.logger.info(f'Reading from file {i+1}/{len(self.screen_paths)}: {path}')
-            with path.open() as fp:
-                for line in fp:
-                    try:
-                        if path.suffix == '.csv':
-                            # The line is comma-separated with the last entry as the string
-                            _, smiles = line.strip().rsplit(",", 1)
-                        elif path.suffix == '.smi':
-                            # The line is just a SMILES string
-                            smiles = line.strip() 
-                        else:
-                            raise ValueError(f'Extension "{path.suffix}" not recognized for "')
-                    except:
-                        continue
-                    self.total_molecules += 1
 
-                    # Add to the chunk and submit if we hit the target size
-                    chunk.append(smiles)
-                    if len(chunk) >= self.chunk_size:
-                        _proxy_and_push(chunk)
-                        chunk = []
-                    
-        # Submit whatever remains
-        _proxy_and_push(chunk)
+            if self.read_on_nodes:
+                # If read on nodes, count the number of molecules so we have some performance tracking
+                with path.open() as fp:
+                    for _ in fp:
+                        self.total_molecules += 1
+                self.total_chunks += 1
+
+                # Submit only the path the queue
+                self.screen_queue.put((path.absolute(), f'file-{self.total_chunks}'))
+
+                # If needed Mark that the queue is completely filled
+                if self.total_chunks == self.queue_depth:
+                    self.logger.info('Queue is filled. Submit tasks now!')
+                    self.queue_filled.set()
+            else:
+                # If not, read the file and create chunks
+                with path.open() as fp:
+                    for line in fp:
+                        try:
+                            if path.suffix == '.csv':
+                                # The line is comma-separated with the last entry as the string
+                                _, smiles = line.strip().rsplit(",", 1)
+                            elif path.suffix == '.smi':
+                                # The line is just a SMILES string
+                                smiles = line.strip()
+                            else:
+                                raise ValueError(f'Extension "{path.suffix}" not recognized for "')
+                        except Exception:
+                            continue
+                        self.total_molecules += 1
+
+                        # Add to the chunk and submit if we hit the target size
+                        chunk.append(smiles)
+                        if len(chunk) >= self.chunk_size:
+                            _proxy_and_push(chunk)
+                            chunk = []
+
+        if not self.read_on_nodes:
+            # Submit whatever remains
+            _proxy_and_push(chunk)
 
         # Put a None at the end to signal we are done
         self.queue_filled.set()  # Make sure the task submitter starts
@@ -345,7 +367,7 @@ class ScreenEngine(BaseThinker):
         self.logger.info(f'Runtime {run_time:.2f} s. Overall evaluation rate: {self.total_molecules / run_time:.3e} mol/s')
 
 
-def screen_molecules(to_screen: List[str], min_similarity: float, to_compare: Tuple[str], radius: int = 4) -> List[Tuple[float, str]]:
+def screen_molecules(to_screen: Union[List[str], Path], min_similarity: float, to_compare: Tuple[str], radius: int = 4) -> List[Tuple[float, str]]:
     """Compute the difference betwee
 
     Args:
@@ -357,6 +379,7 @@ def screen_molecules(to_screen: List[str], min_similarity: float, to_compare: Tu
         List of tuples of the similarity score and molecule IDs for each molecule above min_similarity
     """
     import json
+    from pathlib import Path
     from rdkit import Chem
     from rdkit.Chem import DataStructs, AllChem
     
@@ -387,6 +410,12 @@ def screen_molecules(to_screen: List[str], min_similarity: float, to_compare: Tu
         # Store them for later use
         my_globals['compare_mols'] = compare_mols
         my_globals['compare_mols_hash'] = hash(to_compare) + radius
+
+    # If `to_screen` is a file, read the molecules from it
+    if isinstance(to_screen, Path):
+        assert to_screen.suffix == '.smi', 'File reading only supported from .smi files'
+        with to_screen.open() as fp:
+            to_screen = [x.strip() for x in fp.readlines()]
 
     # Compute max similarity to any of the comparison set, return only those above threshold
     passed = []
@@ -424,18 +453,18 @@ def screen_molecules(to_screen: List[str], min_similarity: float, to_compare: Tu
 if __name__ == '__main__':
     # User inputs
     parser = argparse.ArgumentParser()
+    parser.add_argument('--overwrite', action='store_true', help='Whether to overwrite a previous run')
 
     group = parser.add_argument_group(title='Compute Configuration', description='Settings related to how compute is executed')
-
     group.add_argument("--redishost", default="127.0.0.1", help="Address at which the redis server can be reached")
     group.add_argument("--redisport", default="6379", help="Port on which redis is available")
     group.add_argument("--molecules-per-chunk", default=50000, type=int, help="Number molecules per screening task")
     group.add_argument('--compute', default='local', help='Resource configuration')
     group.add_argument('--proxy-store', default='file', help='What kind of proxy store to use')
-    group.add_argument('--overwrite', action='store_true', help='Whether to overwrite a previous run')
+    group.add_argument('--read-on-nodes', action='store_true', help='Read the molecule files on nodes instead of master')
 
-    group = parser.add_argument_group(title='Search Coonfiguration', description='How we screen for the top molecules')
-    group.add_argument('--search-space', nargs='+', help='Path to molecules to be screened', required=True)
+    group = parser.add_argument_group(title='Search Configuration', description='How we screen for the top molecules')
+    group.add_argument('--search-space', nargs='+', help='Path to molecules to be screened. If only one path provided, we assume it is a glob string')
     group.add_argument('--name', help='Name for the screening selection')
     group.add_argument('--num-top', default=1000000, type=int, help='Number of most-similar molecules to find')
     group.add_argument('--comparison-molecules', required=True, help='Path to the molecule(s) to compare against. Must be line-delimited SMILES')
@@ -446,7 +475,10 @@ if __name__ == '__main__':
     run_params = args.__dict__
 
     # Check that the search path exists
-    search_paths = [Path(x) for x in args.search_space]
+    if len(args.search_space) == 1:
+        search_paths = [Path(x) for x in glob(args.search_space[0], recursive=True)]
+    else:
+        search_paths = [Path(x) for x in args.search_space]
     assert all(x.is_file() for x in search_paths)
 
     # Load in the molecules to be screened
@@ -511,7 +543,7 @@ if __name__ == '__main__':
     task_server = ParslTaskServer([screen_fun], server_q, config)
 
     # Make the thinker
-    thinker = ScreenEngine(client_q, store, search_paths, args.num_top, out_path, n_slots, args.molecules_per_chunk)
+    thinker = ScreenEngine(client_q, store, search_paths, args.num_top, out_path, n_slots, args.molecules_per_chunk, args.read_on_nodes)
 
     # Run the program
     try:
