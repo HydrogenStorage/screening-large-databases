@@ -180,10 +180,10 @@ class ScreenEngine(BaseThinker):
                 self.queue_filled.set()
             
         # Loop over all files
+        chunk = []
         for i, path in enumerate(self.screen_paths): 
             self.logger.info(f'Reading from file {i+1}/{len(self.screen_paths)}: {path}')
             with path.open() as fp:
-                chunk = []
                 for line in fp:
                     try:
                         if path.suffix == '.csv':
