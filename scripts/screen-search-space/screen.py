@@ -189,14 +189,9 @@ class ScreenEngine(BaseThinker):
             self.logger.info(f'Reading from file {i+1}/{len(self.screen_paths)}: {path}')
 
             if self.read_on_nodes:
-                # If read on nodes, count the number of molecules so we have some performance tracking
-                with path.open() as fp:
-                    for _ in fp:
-                        self.total_molecules += 1
-                self.total_chunks += 1
-
                 # Submit only the path the queue
                 self.screen_queue.put((path.absolute(), f'file-{self.total_chunks}'))
+                self.total_chunks += 1
 
                 # If needed Mark that the queue is completely filled
                 if self.total_chunks == self.queue_depth:
@@ -217,7 +212,6 @@ class ScreenEngine(BaseThinker):
                                 raise ValueError(f'Extension "{path.suffix}" not recognized for "')
                         except Exception:
                             continue
-                        self.total_molecules += 1
 
                         # Add to the chunk and submit if we hit the target size
                         chunk.append(smiles)
@@ -234,7 +228,7 @@ class ScreenEngine(BaseThinker):
         self.screen_queue.put(None)
 
         # Mark that we are done reading
-        self.logger.info(f'Finished reading {self.total_molecules} molecules and submitting {self.total_chunks} blocks')
+        self.logger.info(f'Finished reading molecules and submitting {self.total_chunks} blocks')
         self.all_read.set()
 
     @agent(startup=True)
@@ -279,14 +273,20 @@ class ScreenEngine(BaseThinker):
                     raise ValueError('Failed task')
 
                 # Push the result to be processed
-                self.result_queue.put(result.value)
+                screened, count = result.value
+                self.result_queue.put(screened)
                 num_recorded += 1
+                self.total_molecules += count
+
+                # Store the number of molecules in the record
+                result.task_info['count'] = count
                     
                 # Update the start time
                 self.start_time = min(self.start_time, result.time_compute_started)
                 
                 # Remove the chunk from the proxystore
-                self.store.evict(result.task_info['key'])
+                if not self.read_on_nodes:
+                    self.store.evict(result.task_info['key'])
                 
                 # Save the JSON result
                 print(result.json(exclude={'inputs', 'value'}), file=fq)
@@ -367,7 +367,8 @@ class ScreenEngine(BaseThinker):
         self.logger.info(f'Runtime {run_time:.2f} s. Overall evaluation rate: {self.total_molecules / run_time:.3e} mol/s')
 
 
-def screen_molecules(to_screen: Union[List[str], Path], min_similarity: float, to_compare: Tuple[str], radius: int = 4) -> List[Tuple[float, str]]:
+def screen_molecules(to_screen: Union[List[str], Path], min_similarity: float, to_compare: Tuple[str], radius: int = 4) \
+        -> Tuple[List[Tuple[float, str]], int]:
     """Compute the difference betwee
 
     Args:
@@ -376,7 +377,8 @@ def screen_molecules(to_screen: Union[List[str], Path], min_similarity: float, t
         min_similarity: Minimum similarity to be returned by this function
         radius: Radius of the fingerprint
     Returns:
-        List of tuples of the similarity score and molecule IDs for each molecule above min_similarity
+        - List of tuples of the similarity score and molecule IDs for each molecule above min_similarity
+        - Number screened
     """
     import json
     from pathlib import Path
@@ -447,7 +449,7 @@ def screen_molecules(to_screen: Union[List[str], Path], min_similarity: float, t
             'similarities': json.dumps(mol_similarity)
         })))
 
-    return passed
+    return passed, len(to_screen)
 
 
 if __name__ == '__main__':
