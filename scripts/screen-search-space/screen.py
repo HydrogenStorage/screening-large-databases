@@ -22,6 +22,7 @@ from parsl import Config, HighThroughputExecutor
 from parsl.addresses import address_by_hostname
 from parsl.launchers import AprunLauncher
 from parsl.providers import CobaltProvider
+from tqdm import tqdm
 import proxystore as ps
 import numpy as np
 
@@ -143,7 +144,7 @@ class ScreenEngine(BaseThinker):
         self.store = store
 
         # Queue to store ready-to-compute chunks
-        self.queue_depth = slot_count * 32
+        self.queue_depth = slot_count * 8
         self.screen_queue = Queue(self.queue_depth)
 
         # Queue to store results ready to add to the list
@@ -479,7 +480,6 @@ if __name__ == '__main__':
         search_paths = [Path(x) for x in glob(args.search_space[0], recursive=True)]
     else:
         search_paths = [Path(x) for x in args.search_space]
-    assert all(x.is_file() for x in search_paths)
 
     # Load in the molecules to be screened
     with open(args.comparison_molecules) as fp:
