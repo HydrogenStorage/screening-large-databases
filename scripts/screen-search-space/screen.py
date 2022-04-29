@@ -14,6 +14,7 @@ import logging
 import heapq
 import gzip
 import json
+import bz2
 
 from colmena.redis.queue import make_queue_pairs, ClientQueues
 from colmena.task_server import ParslTaskServer
@@ -22,7 +23,6 @@ from parsl import Config, HighThroughputExecutor
 from parsl.addresses import address_by_hostname
 from parsl.launchers import AprunLauncher
 from parsl.providers import CobaltProvider
-from tqdm import tqdm
 import proxystore as ps
 import numpy as np
 
@@ -47,55 +47,55 @@ def parsl_config(name: str) -> Tuple[Config, int]:
         return Config(
             retries=2,
             executors=[HighThroughputExecutor(
-                    address=address_by_hostname(),
-                    label="debug",
-                    max_workers=64,
-                    prefetch_capacity=2,
-                    cpu_affinity='block',
-                    provider=CobaltProvider(
-                        account='redox_adsp',
-                        queue='debug-flat-quad',
-                        nodes_per_block=8,
-                        scheduler_options='#COBALT --attrs enable_ssh=1',
-                        walltime='00:60:00',
-                        init_blocks=0,
-                        max_blocks=1,
-                        cmd_timeout=360,
-                        launcher=AprunLauncher(overrides='-d 64 --cc depth -j 2'),
-                        worker_init='''
+                address=address_by_hostname(),
+                label="debug",
+                max_workers=64,
+                prefetch_capacity=2,
+                cpu_affinity='block',
+                provider=CobaltProvider(
+                    account='redox_adsp',
+                    queue='debug-flat-quad',
+                    nodes_per_block=8,
+                    scheduler_options='#COBALT --attrs enable_ssh=1',
+                    walltime='00:60:00',
+                    init_blocks=0,
+                    max_blocks=1,
+                    cmd_timeout=360,
+                    launcher=AprunLauncher(overrides='-d 64 --cc depth -j 2'),
+                    worker_init='''
 module load miniconda-3
 conda activate /lus/eagle/projects/ExaLearn/carbon-free-ldrd/env''',
-                    ),
-                )]
-            ), 64 * 8 * 2
+                ),
+            )]
+        ), 64 * 8 * 2
     elif name == 'theta-full':
         return Config(
             retries=2,
             executors=[HighThroughputExecutor(
-                    address=address_by_hostname(),
-                    label="full",
-                    max_workers=64,
-                    prefetch_capacity=192,
-                    cpu_affinity='block',
-                    provider=CobaltProvider(
-                        account='CSC249ADCD08',
-                        nodes_per_block=128,
-                        scheduler_options='#COBALT --attrs enable_ssh=1',
-                        walltime='01:00:00',
-                        init_blocks=0,
-                        max_blocks=1,
-                        cmd_timeout=360,
-                        launcher=AprunLauncher(overrides='-d 64 --cc depth -j 2'),
-                        worker_init=f'''
+                address=address_by_hostname(),
+                label="full",
+                max_workers=64,
+                prefetch_capacity=192,
+                cpu_affinity='block',
+                provider=CobaltProvider(
+                    account='CSC249ADCD08',
+                    nodes_per_block=128,
+                    scheduler_options='#COBALT --attrs enable_ssh=1',
+                    walltime='01:00:00',
+                    init_blocks=0,
+                    max_blocks=1,
+                    cmd_timeout=360,
+                    launcher=AprunLauncher(overrides='-d 64 --cc depth -j 2'),
+                    worker_init=f'''
 module load miniconda-3
 conda activate /lus/eagle/projects/ExaLearn/carbon-free-ldrd/env
 export PYTHONPATH="$PYTHONPATH:{Path(__file__).parent}"
 pwd 
 which python
 ''',
-                    ),
-                )]
-            ), 128 * 64 * 5
+                ),
+            )]
+        ), 128 * 64 * 5
     else:
         raise ValueError(f'Configuration not defined: {name}')
 
@@ -159,35 +159,35 @@ class ScreenEngine(BaseThinker):
         self.queue_filled = Event()
         self.total_chunks = 0
         self.total_molecules = 0
-        
+
         # Recording for performance information
         self.start_time = np.inf  # Use the time the first compute starts
 
     @agent(startup=True)
     def read_chunks(self):
         """Read chunks to be screened"""
-        
+
         # Make a function to push a chunk of molecules to the execution queue
         def _proxy_and_push(chunk):
             # Submit the object to the proxy store
             key = f'chunk-{self.total_chunks}'
             chunk_proxy = self.store.proxy(chunk, key=key)
-            
+
             # Increment the count
             self.total_chunks += 1
-            
+
             # Put the proxy and the key in the queue
             self.screen_queue.put((chunk_proxy, key))
-            
+
             # Mark that the queue is completely filled
             if self.total_chunks == self.queue_depth:
                 self.logger.info('Queue is filled. Submit tasks now!')
                 self.queue_filled.set()
-            
+
         # Loop over all files
         chunk = []
-        for i, path in enumerate(self.screen_paths): 
-            self.logger.info(f'Reading from file {i+1}/{len(self.screen_paths)}: {path}')
+        for i, path in enumerate(self.screen_paths):
+            self.logger.info(f'Reading from file {i + 1}/{len(self.screen_paths)}: {path}')
 
             if self.read_on_nodes:
                 # Submit only the path the queue
@@ -199,26 +199,37 @@ class ScreenEngine(BaseThinker):
                     self.logger.info('Queue is filled. Submit tasks now!')
                     self.queue_filled.set()
             else:
-                # If not, read the file and create chunks
-                with path.open() as fp:
-                    for line in fp:
-                        try:
-                            if path.suffix == '.csv':
-                                # The line is comma-separated with the last entry as the string
-                                _, smiles = line.strip().rsplit(",", 1)
-                            elif path.suffix == '.smi':
-                                # The line is just a SMILES string
-                                smiles = line.strip()
-                            else:
-                                raise ValueError(f'Extension "{path.suffix}" not recognized for "')
-                        except Exception:
-                            continue
+                if path.suffix == '.bz2':
+                    fp = bz2.open(path, 'rt')
+                else:
+                    fp = path.open()
 
-                        # Add to the chunk and submit if we hit the target size
-                        chunk.append(smiles)
-                        if len(chunk) >= self.chunk_size:
-                            _proxy_and_push(chunk)
-                            chunk = []
+                # Start the chunks
+                chunk = []
+                for line in fp:
+                    try:
+                        if path.suffix == '.csv':
+                            # The line is comma-separated with the last entry as the string
+                            _, smiles = line.strip().rsplit(",", 1)
+                        elif path.suffix == '.smi':
+                            # The line is just a SMILES string
+                            smiles = line.strip()
+                        elif path.suffix == '.bz2':
+                            # The SMILES string is the first entry
+                            smiles, _ = line.split("\t", 1)
+                        else:
+                            raise ValueError(f'Extension "{path.suffix}" not recognized for "')
+                    except:
+                        raise
+                    self.total_molecules += 1
+
+                    # Add to the chunk and submit if we hit the target size
+                    chunk.append(smiles)
+                    if len(chunk) >= self.chunk_size:
+                        _proxy_and_push(chunk)
+                        chunk = []
+
+                fp.close()
 
         if not self.read_on_nodes:
             # Submit whatever remains
@@ -235,17 +246,17 @@ class ScreenEngine(BaseThinker):
     @agent(startup=True)
     def submit_task(self):
         """Submit chunks of molecules to be screened"""
-        
+
         # Wait until the queue is filled
         self.queue_filled.wait()
         self.logger.info('Starting to submit tasks.')
-        
+
         while True:
             # Get the next chunk and, if None, break
             msg = self.screen_queue.get()
             if msg is None:
                 break
-                
+
             # Create a proxy for the chunk data
             chunk, key = msg
 
@@ -276,14 +287,14 @@ class ScreenEngine(BaseThinker):
                 # Push the result to be processed
                 self.result_queue.put(result.value)
                 num_recorded += 1
-    
+
                 # Update the start time
                 self.start_time = min(self.start_time, result.time_compute_started)
-                
+
                 # Remove the chunk from the proxystore
                 if not self.read_on_nodes:
                     self.store.evict(result.task_info['key'])
-                
+
                 # Save the JSON result
                 print(result.json(exclude={'inputs', 'value'}), file=fq)
 
@@ -347,7 +358,7 @@ class ScreenEngine(BaseThinker):
 
         # Write the data out to disk
         self.logger.info(f'Completed processing all results. Output list size: {len(self.best_mols)}. Sorting results now')
-        
+
         self.best_mols.sort(reverse=True)
         self.logger.info('Finished sorting. Writing to disk')
 
@@ -359,7 +370,7 @@ class ScreenEngine(BaseThinker):
                 entry['score'] = record.priority
                 writer.writerow(entry)
         self.logger.info('Finished writing results to disk')
-        
+
         # Write out the total run time.
         run_time = datetime.now().timestamp() - self.start_time
         self.logger.info(f'Runtime {run_time:.2f} s. Overall evaluation rate: {self.total_molecules / run_time:.3e} mol/s')
@@ -382,7 +393,7 @@ def screen_molecules(to_screen: Union[List[str], Path], min_similarity: float, t
     from pathlib import Path
     from rdkit import Chem
     from rdkit.Chem import DataStructs, AllChem
-    
+
     # Turn off logging
     import rdkit.rdBase as rkrb
     import rdkit.RDLogger as rkl
@@ -432,7 +443,7 @@ def screen_molecules(to_screen: Union[List[str], Path], min_similarity: float, t
         # Compute the maximum similarity to the comparison set
         mol_similarity = DataStructs.BulkTanimotoSimilarity(fp, compare_mols)
         max_similarity = max(mol_similarity)
-        
+
         # If it is an exact match, skip it
         if max_similarity == 1.0:
             continue
@@ -483,7 +494,7 @@ if __name__ == '__main__':
     # Load in the molecules to be screened
     with open(args.comparison_molecules) as fp:
         to_compare = [x.strip() for x in fp]
-    
+
     # Create an output directory with the name of the directory
     run_hash = sha256()
     run_hash.update(str(run_params).encode())
@@ -491,14 +502,14 @@ if __name__ == '__main__':
     name = args.name if args.name is not None else search_paths[0].name[:-4]
     out_path = Path().joinpath('runs', f'{name}-top{args.num_top}-{run_hash.hexdigest()[:6]}')
     out_path.mkdir(parents=True, exist_ok=args.overwrite)
-    
+
     # Store the run parameters
     with open(out_path / 'run-config.json', 'w') as fp:
         json.dump(run_params, fp, indent=2)
     with open(out_path / 'to-compare.smi', 'w') as fp:
         for s in to_compare:
             print(s, file=fp)
-    
+
     # Set up the logging
     handlers = [logging.FileHandler(out_path / 'runtime.log', mode='w'), logging.StreamHandler(sys.stdout)]
 
@@ -537,7 +548,8 @@ if __name__ == '__main__':
         raise ValueError('ProxyStore config not recognized: {}')
 
     # Make the task queues and task server
-    client_q, server_q = make_queue_pairs(args.redishost, args.redisport, keep_inputs=False, serialization_method='pickle',
+    client_q, server_q = make_queue_pairs(args.redishost, args.redisport, name=name,
+                                          keep_inputs=False, serialization_method='pickle',
                                           proxystore_threshold=1000, proxystore_name=store.name)
     task_server = ParslTaskServer([screen_fun], server_q, config)
 
