@@ -64,7 +64,7 @@ def parsl_config(name: str) -> Tuple[Config, int]:
                         launcher=AprunLauncher(overrides='-d 64 --cc depth -j 2'),
                         worker_init='''
 module load miniconda-3
-conda activate /lus/theta-fs0/projects/CSC249ADCD08/carbon-free-ldrd/env''',
+conda activate /lus/eagle/projects/ExaLearn/carbon-free-ldrd/env''',
                     ),
                 )]
             ), 64 * 8 * 2
@@ -79,9 +79,9 @@ conda activate /lus/theta-fs0/projects/CSC249ADCD08/carbon-free-ldrd/env''',
                     cpu_affinity='block',
                     provider=CobaltProvider(
                         account='CSC249ADCD08',
-                        nodes_per_block=512,
+                        nodes_per_block=128,
                         scheduler_options='#COBALT --attrs enable_ssh=1',
-                        walltime='09:00:00',
+                        walltime='01:00:00',
                         init_blocks=0,
                         max_blocks=1,
                         cmd_timeout=360,
@@ -95,7 +95,7 @@ which python
 ''',
                     ),
                 )]
-            ), 512 * 64 * 5
+            ), 128 * 64 * 5
     else:
         raise ValueError(f'Configuration not defined: {name}')
 
@@ -274,14 +274,9 @@ class ScreenEngine(BaseThinker):
                     raise ValueError('Failed task')
 
                 # Push the result to be processed
-                screened, count = result.value
-                self.result_queue.put(screened)
+                self.result_queue.put(result.value)
                 num_recorded += 1
-                self.total_molecules += count
-
-                # Store the number of molecules in the record
-                result.task_info['count'] = count
-                    
+    
                 # Update the start time
                 self.start_time = min(self.start_time, result.time_compute_started)
                 
@@ -303,7 +298,7 @@ class ScreenEngine(BaseThinker):
 
         # Print the final status
         run_time = datetime.now().timestamp() - self.start_time
-        self.logger.info(f'Completed storing all results. {run_time:.2f} s. Overall evaluation rate: {self.total_molecules / run_time:.3e} mol/s')
+        self.logger.info(f'Completed storing all results. {run_time:.2f} s.')
 
     @agent()
     def store_results(self):
@@ -316,7 +311,9 @@ class ScreenEngine(BaseThinker):
         count = 0
         while not self.done.is_set():
             # Get the next chunk ready for processing
-            result: List[Tuple[float, str]] = self.result_queue.get()
+            msg: Tuple[List[Tuple[float, str]], int] = self.result_queue.get()
+            result, n_mols = msg
+            self.total_molecules += n_mols
             count += 1
 
             # If it is `None` we are done
@@ -342,7 +339,7 @@ class ScreenEngine(BaseThinker):
                 self.current_threshold = self.best_mols[0].priority
 
             # Print a status message
-            status = f'Number received: {len(result)}. New threshold: {self.current_threshold:.4f}'
+            status = f'Number sent: {n_mols}. Number received: {len(result)} ({n_mols / len(result) * 100:.2f}%). New threshold: {self.current_threshold:.4f}'
             if self.all_read.is_set():
                 self.logger.info(f'Processed task {count}/{self.total_chunks}. {status}')
             else:
