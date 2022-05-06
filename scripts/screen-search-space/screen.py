@@ -50,7 +50,7 @@ def parsl_config(name: str) -> Tuple[Config, int]:
                 address=address_by_hostname(),
                 label="debug",
                 max_workers=64,
-                prefetch_capacity=2,
+                prefetch_capacity=192,
                 cpu_affinity='block',
                 provider=CobaltProvider(
                     account='redox_adsp',
@@ -67,7 +67,7 @@ module load miniconda-3
 conda activate /lus/eagle/projects/ExaLearn/carbon-free-ldrd/env''',
                 ),
             )]
-        ), 64 * 8 * 2
+        ), 64 * 8 * 5
     elif name == 'theta-full':
         return Config(
             retries=2,
@@ -191,7 +191,8 @@ class ScreenEngine(BaseThinker):
 
             if self.read_on_nodes:
                 # Submit only the path the queue
-                self.screen_queue.put((path.absolute(), f'file-{self.total_chunks}'))
+                self.screen_queue.put(
+                    (path.absolute(), f'file-{self.total_chunks}'))
                 self.total_chunks += 1
 
                 # If needed Mark that the queue is completely filled
@@ -280,23 +281,26 @@ class ScreenEngine(BaseThinker):
                 # Wait for a chunk to be received
                 result = self.queues.get_result()
                 self.rec.release("screen", 1)
-                if not result.success:
-                    self.logger.error(f'Task failed. Traceback: {result.failure_info.traceback}')
-                    raise ValueError('Failed task')
-
-                # Push the result to be processed
-                self.result_queue.put(result.value)
                 num_recorded += 1
 
+                # Save the JSON result
+                print(result.json(exclude={'inputs', 'value'}), file=fq)
+
                 # Update the start time
-                self.start_time = min(self.start_time, result.time_compute_started)
+                self.start_time = min(
+                    self.start_time, result.time_compute_started)
 
                 # Remove the chunk from the proxystore
                 if not self.read_on_nodes:
                     self.store.evict(result.task_info['key'])
 
-                # Save the JSON result
-                print(result.json(exclude={'inputs', 'value'}), file=fq)
+                # If unsuccessful, just skip this one
+                if not result.success:
+                    self.logger.error(
+                        f'Task failed. Traceback: {result.failure_info.traceback}')
+                else:
+                    # Push the result to be processed
+                    self.result_queue.put(result.value)
 
                 # Print a status message
                 if self.all_read.is_set():
@@ -323,13 +327,15 @@ class ScreenEngine(BaseThinker):
         while not self.done.is_set():
             # Get the next chunk ready for processing
             msg: Tuple[List[Tuple[float, str]], int] = self.result_queue.get()
+
+            # If it is `None` we are done
+            if msg is None:
+                break
+
+            # Otherwise, unpack the results!
             result, n_mols = msg
             self.total_molecules += n_mols
             count += 1
-
-            # If it is `None` we are done
-            if result is None:
-                break
 
             # Add objects to the priority queue heap
             for score, entry in result:
@@ -337,33 +343,39 @@ class ScreenEngine(BaseThinker):
                 if reached_target_size:
                     # Maintain the heap size
                     removed = heapq.heappushpop(self.best_mols, item)
-                    assert removed.priority <= item.priority, (removed.priority, item.priority)
+                    assert removed.priority <= item.priority, (
+                        removed.priority, item.priority)
                 else:
                     # Add to the queue without removing
                     heapq.heappush(self.best_mols, item)
-                    reached_target_size = len(self.best_mols) >= self.target_count
+                    reached_target_size = len(
+                        self.best_mols) >= self.target_count
                     if reached_target_size:
-                        self.logger.info(f'We have filled the queue of {len(self.best_mols)} best molecules')
+                        self.logger.info(
+                            f'We have filled the queue of {len(self.best_mols)} best molecules')
 
             # Update the minimum value required to be on
             if reached_target_size:
                 self.current_threshold = self.best_mols[0].priority
 
             # Print a status message
-            status = f'Number sent: {n_mols}. Number received: {len(result)} ({n_mols / len(result) * 100:.2f}%). New threshold: {self.current_threshold:.4f}'
+            status = f'Number sent: {n_mols}. Number received: {len(result)} ({len(result) / n_mols * 100:.2f}%). New threshold: {self.current_threshold:.4f}'
             if self.all_read.is_set():
-                self.logger.info(f'Processed task {count}/{self.total_chunks}. {status}')
+                self.logger.info(
+                    f'Processed task {count}/{self.total_chunks}. {status}')
             else:
                 self.logger.info(f'Processed task {count}/???. {status}')
 
         # Write the data out to disk
-        self.logger.info(f'Completed processing all results. Output list size: {len(self.best_mols)}. Sorting results now')
+        self.logger.info(
+            f'Completed processing all results. Output list size: {len(self.best_mols)}. Sorting results now')
 
         self.best_mols.sort(reverse=True)
         self.logger.info('Finished sorting. Writing to disk')
 
         with gzip.open(self.output_dir / 'best_molecules.csv.gz', 'wt') as fp:
-            writer = DictWriter(fp, ['smiles', 'inchi', 'score', 'similarities'])
+            writer = DictWriter(
+                fp, ['smiles', 'inchi', 'score', 'similarities'])
             writer.writeheader()
             for record in self.best_mols:
                 entry = json.loads(record.item)
@@ -373,7 +385,7 @@ class ScreenEngine(BaseThinker):
 
         # Write out the total run time.
         run_time = datetime.now().timestamp() - self.start_time
-        self.logger.info(f'Runtime {run_time:.2f} s. Overall evaluation rate: {self.total_molecules / run_time:.3e} mol/s')
+        self.logger.info(f'Runtime {run_time:.2f} s. Total molecules: {self.total_molecules}. Overall evaluation rate: {self.total_molecules / run_time:.3e} mol/s')
 
 
 def screen_molecules(to_screen: Union[List[str], Path], min_similarity: float, to_compare: Tuple[str], radius: int = 4) \
@@ -464,22 +476,35 @@ def screen_molecules(to_screen: Union[List[str], Path], min_similarity: float, t
 if __name__ == '__main__':
     # User inputs
     parser = argparse.ArgumentParser()
-    parser.add_argument('--overwrite', action='store_true', help='Whether to overwrite a previous run')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Whether to overwrite a previous run')
 
-    group = parser.add_argument_group(title='Compute Configuration', description='Settings related to how compute is executed')
-    group.add_argument("--redishost", default="127.0.0.1", help="Address at which the redis server can be reached")
-    group.add_argument("--redisport", default="6379", help="Port on which redis is available")
-    group.add_argument("--molecules-per-chunk", default=50000, type=int, help="Number molecules per screening task")
-    group.add_argument('--compute', default='local', help='Resource configuration')
-    group.add_argument('--proxy-store', default='file', help='What kind of proxy store to use')
-    group.add_argument('--read-on-nodes', action='store_true', help='Read the molecule files on nodes instead of master')
+    group = parser.add_argument_group(
+        title='Compute Configuration', description='Settings related to how compute is executed')
+    group.add_argument("--redishost", default="127.0.0.1",
+                       help="Address at which the redis server can be reached")
+    group.add_argument("--redisport", default="6379",
+                       help="Port on which redis is available")
+    group.add_argument("--molecules-per-chunk", default=50000,
+                       type=int, help="Number molecules per screening task")
+    group.add_argument('--compute', default='local',
+                       help='Resource configuration')
+    group.add_argument('--proxy-store', default='file',
+                       help='What kind of proxy store to use')
+    group.add_argument('--read-on-nodes', action='store_true',
+                       help='Read the molecule files on nodes instead of master')
 
-    group = parser.add_argument_group(title='Search Configuration', description='How we screen for the top molecules')
-    group.add_argument('--search-space', nargs='+', help='Path to molecules to be screened. If only one path provided, we assume it is a glob string')
+    group = parser.add_argument_group(
+        title='Search Configuration', description='How we screen for the top molecules')
+    group.add_argument('--search-space', nargs='+',
+                       help='Path to molecules to be screened. If only one path provided, we assume it is a glob string')
     group.add_argument('--name', help='Name for the screening selection')
-    group.add_argument('--num-top', default=1000000, type=int, help='Number of most-similar molecules to find')
-    group.add_argument('--comparison-molecules', required=True, help='Path to the molecule(s) to compare against. Must be line-delimited SMILES')
-    group.add_argument('--radius', default=4, type=int, help='Radius of the fingerprint')
+    group.add_argument('--num-top', default=1000000, type=int,
+                       help='Number of most-similar molecules to find')
+    group.add_argument('--comparison-molecules', required=True,
+                       help='Path to the molecule(s) to compare against. Must be line-delimited SMILES')
+    group.add_argument('--radius', default=4, type=int,
+                       help='Radius of the fingerprint')
 
     # Parse the arguments
     args = parser.parse_args()
@@ -487,7 +512,8 @@ if __name__ == '__main__':
 
     # Check that the search path exists
     if len(args.search_space) == 1:
-        search_paths = [Path(x) for x in glob(args.search_space[0], recursive=True)]
+        search_paths = [Path(x) for x in glob(
+            args.search_space[0], recursive=True)]
     else:
         search_paths = [Path(x) for x in args.search_space]
 
@@ -500,7 +526,8 @@ if __name__ == '__main__':
     run_hash.update(str(run_params).encode())
     run_hash.update(str(to_compare).encode())
     name = args.name if args.name is not None else search_paths[0].name[:-4]
-    out_path = Path().joinpath('runs', f'{name}-top{args.num_top}-{run_hash.hexdigest()[:6]}')
+    out_path = Path().joinpath(
+        'runs', f'{name}-top{args.num_top}-{run_hash.hexdigest()[:6]}')
     out_path.mkdir(parents=True, exist_ok=args.overwrite)
 
     # Store the run parameters
@@ -511,15 +538,14 @@ if __name__ == '__main__':
             print(s, file=fp)
 
     # Set up the logging
-    handlers = [logging.FileHandler(out_path / 'runtime.log', mode='w'), logging.StreamHandler(sys.stdout)]
-
+    handlers = [logging.FileHandler(
+        out_path / 'runtime.log', mode='w'), logging.StreamHandler(sys.stdout)]
 
     class ParslFilter(logging.Filter):
         """Filter out Parsl debug logs"""
 
         def filter(self, record):
             return not (record.levelno == logging.DEBUG and '/parsl/' in record.pathname)
-
 
     for h in handlers:
         h.addFilter(ParslFilter())
@@ -528,22 +554,26 @@ if __name__ == '__main__':
                         level=logging.INFO, handlers=handlers)
 
     # Log the run information
-    logging.info(f'Finding the {args.num_top} molecules that are closest to {len(to_compare)} examples out of {len(search_paths)} files. Saving to {out_path}')
+    logging.info(
+        f'Finding the {args.num_top} molecules that are closest to {len(to_compare)} examples out of {len(search_paths)} files. Saving to {out_path}')
 
     # Prepare the screening function
-    screen_fun = partial(screen_molecules, to_compare=tuple(to_compare), radius=args.radius)
+    screen_fun = partial(screen_molecules, to_compare=tuple(
+        to_compare), radius=args.radius)
     update_wrapper(screen_fun, screen_molecules)
 
     # Make Parsl engine
     config, n_slots = parsl_config(args.compute)
 
-    # Configure the file 
+    # Configure the file
     if args.proxy_store == 'file':
         ps_file_dir = out_path / 'file-store'
         ps_file_dir.mkdir(exist_ok=True)
-        store = ps.store.init_store(ps.store.STORES.FILE, name='file', store_dir=str(ps_file_dir))
+        store = ps.store.init_store(
+            ps.store.STORES.FILE, name='file', store_dir=str(ps_file_dir))
     elif args.proxy_store == 'redis':
-        store = ps.store.init_store(ps.store.STORES.REDIS, name='redis', hostname=args.redishost, port=args.redisport)
+        store = ps.store.init_store(
+            ps.store.STORES.REDIS, name='redis', hostname=args.redishost, port=args.redisport)
     else:
         raise ValueError('ProxyStore config not recognized: {}')
 
@@ -554,7 +584,8 @@ if __name__ == '__main__':
     task_server = ParslTaskServer([screen_fun], server_q, config)
 
     # Make the thinker
-    thinker = ScreenEngine(client_q, store, search_paths, args.num_top, out_path, n_slots, args.molecules_per_chunk, args.read_on_nodes)
+    thinker = ScreenEngine(client_q, store, search_paths, args.num_top,
+                           out_path, n_slots, args.molecules_per_chunk, args.read_on_nodes)
 
     # Run the program
     try:
