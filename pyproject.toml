@@ -1,3 +1,8 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
 name = 'cfree'
 version = '0.0.1'
 description = 'Utilities employed while designing molecules for hydrogen fuel storage'
@@ -5,7 +10,7 @@ authors = [
     'Logan Ward <ward.logan.t@gmail.com>'
 ]
 packages = [
-    {include = 'cfree'}
+    {include = "cfree"},
 ]
 
 [tool.poetry.dependencies]
