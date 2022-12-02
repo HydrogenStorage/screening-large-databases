@@ -50,10 +50,10 @@ def parsl_config(name: str) -> Tuple[Config, int]:
                 address=address_by_hostname(),
                 label="debug",
                 max_workers=64,
-                prefetch_capacity=192,
+                prefetch_capacity=64,
                 cpu_affinity='block',
                 provider=CobaltProvider(
-                    account='redox_adsp',
+                    account='CSC249ADCD08',
                     queue='debug-flat-quad',
                     nodes_per_block=8,
                     scheduler_options='#COBALT --attrs enable_ssh=1',
@@ -67,7 +67,7 @@ module load miniconda-3
 conda activate /lus/eagle/projects/ExaLearn/carbon-free-ldrd/env''',
                 ),
             )]
-        ), 64 * 8 * 5
+        ), 64 * 8 * 3
     elif name == 'theta-full':
         return Config(
             retries=2,
@@ -75,7 +75,7 @@ conda activate /lus/eagle/projects/ExaLearn/carbon-free-ldrd/env''',
                 address=address_by_hostname(),
                 label="full",
                 max_workers=64,
-                prefetch_capacity=192,
+                prefetch_capacity=64,
                 cpu_affinity='block',
                 provider=CobaltProvider(
                     account='CSC249ADCD08',
@@ -95,7 +95,7 @@ which python
 ''',
                 ),
             )]
-        ), 128 * 64 * 5
+        ), 128 * 64 * 3
     else:
         raise ValueError(f'Configuration not defined: {name}')
 
@@ -222,7 +222,6 @@ class ScreenEngine(BaseThinker):
                             raise ValueError(f'Extension "{path.suffix}" not recognized for "')
                     except:
                         raise
-                    self.total_molecules += 1
 
                     # Add to the chunk and submit if we hit the target size
                     chunk.append(smiles)
@@ -287,8 +286,7 @@ class ScreenEngine(BaseThinker):
                 print(result.json(exclude={'inputs', 'value'}), file=fq)
 
                 # Update the start time
-                self.start_time = min(
-                    self.start_time, result.time_compute_started)
+                self.start_time = min(self.start_time, result.time_compute_started)
 
                 # Remove the chunk from the proxystore
                 if not self.read_on_nodes:
@@ -296,8 +294,7 @@ class ScreenEngine(BaseThinker):
 
                 # If unsuccessful, just skip this one
                 if not result.success:
-                    self.logger.error(
-                        f'Task failed. Traceback: {result.failure_info.traceback}')
+                    self.logger.error(f'Task failed. Traceback: {result.failure_info.traceback}')
                 else:
                     # Push the result to be processed
                     self.result_queue.put(result.value)
@@ -344,15 +341,14 @@ class ScreenEngine(BaseThinker):
                     # Maintain the heap size
                     removed = heapq.heappushpop(self.best_mols, item)
                     assert removed.priority <= item.priority, (
-                        removed.priority, item.priority)
+                        removed.priority, item.priority
+                    )
                 else:
                     # Add to the queue without removing
                     heapq.heappush(self.best_mols, item)
-                    reached_target_size = len(
-                        self.best_mols) >= self.target_count
+                    reached_target_size = len(self.best_mols) >= self.target_count
                     if reached_target_size:
-                        self.logger.info(
-                            f'We have filled the queue of {len(self.best_mols)} best molecules')
+                        self.logger.info(f'We have filled the queue of {len(self.best_mols)} best molecules')
 
             # Update the minimum value required to be on
             if reached_target_size:
@@ -361,21 +357,18 @@ class ScreenEngine(BaseThinker):
             # Print a status message
             status = f'Number sent: {n_mols}. Number received: {len(result)} ({len(result) / n_mols * 100:.2f}%). New threshold: {self.current_threshold:.4f}'
             if self.all_read.is_set():
-                self.logger.info(
-                    f'Processed task {count}/{self.total_chunks}. {status}')
+                self.logger.info(f'Processed task {count}/{self.total_chunks}. {status}')
             else:
                 self.logger.info(f'Processed task {count}/???. {status}')
 
         # Write the data out to disk
-        self.logger.info(
-            f'Completed processing all results. Output list size: {len(self.best_mols)}. Sorting results now')
+        self.logger.info(f'Completed processing all results. Output list size: {len(self.best_mols)}. Sorting results now')
 
         self.best_mols.sort(reverse=True)
         self.logger.info('Finished sorting. Writing to disk')
 
         with gzip.open(self.output_dir / 'best_molecules.csv.gz', 'wt') as fp:
-            writer = DictWriter(
-                fp, ['smiles', 'inchi', 'score', 'similarities'])
+            writer = DictWriter(fp, ['smiles', 'inchi', 'score', 'similarities'])
             writer.writeheader()
             for record in self.best_mols:
                 entry = json.loads(record.item)
