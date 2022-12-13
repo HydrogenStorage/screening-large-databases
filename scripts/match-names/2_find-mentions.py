@@ -89,9 +89,9 @@ conda activate /lus/eagle/projects/ExaLearn/carbon-free-ldrd/env-cpu''',
                 cpu_affinity='block',
                 provider=CobaltProvider(
                     account='SuperBERT',
-                    nodes_per_block=128,
+                    nodes_per_block=900,
                     scheduler_options='#COBALT --attrs enable_ssh=1',
-                    walltime='03:00:00',
+                    walltime='20:00:00',
                     init_blocks=0,
                     max_blocks=1,
                     cmd_timeout=360,
@@ -106,7 +106,7 @@ which python
                 ),
             )],
             run_dir=run_path
-        ), 128 * 64 * 3
+        ), 900 * 64 * 4
     else:
         raise ValueError(f'Configuration not defined: {name}')
 
@@ -383,7 +383,7 @@ def find_matches(lines: List[str], names: List[Tuple[str, str]]) -> Dict[str, Li
     output = defaultdict(list)
 
     # Beginning and ends of strings
-    start_chars = ' )'
+    start_chars = ' ('
     end_chars = ' ).;,:'
     caps = list(product(start_chars, end_chars))
     
