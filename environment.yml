@@ -2,10 +2,12 @@ name: cfree
 channels:
   - defaults
   - conda-forge
+  - openbabel
 dependencies:
   # Core dependencies
-  - python==3.9.*
+  - python==3.7.*
   - scikit-learn>=1
+  - matplotlib>3
   - redis==5.0.3
   - redis-py==3.4.*
   - jupyterlab
@@ -14,20 +16,26 @@ dependencies:
   - pip
 
 # Dependencies from the molecular design app
-  - openbabel==3.1.1
-  - geometric==0.9.*
-  - qcengine==0.18.*
   - rdkit==2021.09.4
-  - py-cpuinfo<6
+  - openbabel<3
+  - pint==0.18.*
   - mongodb==4.*
   - psutil
   - tqdm
 
 # Pip packages for all of them
   - pip:
-#      - -e . 
-      - parsl[monitoring]>=1.*
+      # Other
+      - -e . 
+      - parsl
       - mongoengine~=0.24
-      - pydantic
-      - git+https://github.com/exalearn/colmena.git
-      - git+https://github.com/qmlcode/qml.git@develop
+      - colmena
+
+      # Autochem and its dependencies
+      - libs/autochem
+      - libs/autoio/autoio-base/
+      - qcelemental
+      - pyyaml
+      - future
+      - more_itertools
+      - networkx

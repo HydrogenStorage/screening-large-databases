@@ -1,0 +1,6 @@
+[submodule "libs/autochem"]
+	path = libs/autochem
+	url = git@github.com:Auto-Mech/autochem.git
+[submodule "libs/autoio"]
+	path = libs/autoio
+	url = git@github.com:Auto-Mech/autoio.git
