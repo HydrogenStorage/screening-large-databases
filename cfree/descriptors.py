@@ -40,3 +40,25 @@ def compute_wth2(smiles_dehydrogenated: str, smiles_hydrogenated: Optional[str] 
     mw_hydrogenated = Chem.Descriptors.ExactMolWt(Chem.MolFromSmiles(smiles_hydrogenated))
     mw_dehydrogenated = Chem.Descriptors.ExactMolWt(Chem.MolFromSmiles(smiles_dehydrogenated))
     return ((mw_hydrogenated - mw_dehydrogenated) / mw_hydrogenated) * 100
+
+
+def count_h2_difference(smiles_dehydrogenated: str, smiles_hydrogenated: Optional[str] = None) -> int:
+    """Count the H2 difference between hydrogenated and unhydrogenated state
+
+    Args:
+        smiles_dehydrogenated: Dehydrogenated form of the molecule
+        smiles_hydrogenated: Hydrogenated form. If `None`, we will compute the fully-hydrogenated form
+    Returns:
+        Number of H2s between each
+    """
+
+    if smiles_hydrogenated is None:
+        smiles_hydrogenated = saturate_molecule(smiles_dehydrogenated)
+
+    # Count H2s
+    def _count(smiles):
+        mol = Chem.MolFromSmiles(smiles)
+        mol = Chem.AddHs(mol)
+        return len([x for x in mol.GetAtoms() if x.GetAtomicNum() == 1])
+
+    return (_count(smiles_hydrogenated) - _count(smiles_dehydrogenated)) // 2
