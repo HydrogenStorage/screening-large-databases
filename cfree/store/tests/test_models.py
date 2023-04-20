@@ -11,3 +11,7 @@ def test_initialization():
 
     with raises(ValueError):
         MoleculeRecord.from_identifier(inchi='Nah')
+    with raises(ValueError):
+        MoleculeRecord.from_identifier(inchi='Not', smiles='Both')
+
+    doc.property['wt%'] = 1.

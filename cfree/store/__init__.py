@@ -1,6 +1,6 @@
 from typing import Optional
 
-from mongoengine import Document, DynamicEmbeddedDocument, EmbeddedDocument, IntField, EmbeddedDocumentField
+from mongoengine import Document, DynamicEmbeddedDocument, EmbeddedDocument, IntField, EmbeddedDocumentField, MapField, FloatField
 from mongoengine.fields import StringField, ListField
 from rdkit import Chem
 
@@ -23,10 +23,12 @@ class MoleculeRecord(Document):
 
     # Characteristics
     subsets = ListField(StringField(), help_text='List of subsets this molecule is part of')
+    property = MapField(FloatField(), help_text='Property values associated with this object')
 
     @classmethod
     def from_identifier(cls, smiles: Optional[str] = None, inchi: Optional[str] = None):
-        assert (smiles is not None) ^ (inchi is not None), "You must supply either smiles or inchi, and not both"
+        if not ((smiles is None) ^ (inchi is None)):
+            raise ValueError("You must supply either smiles or inchi, and not both")
 
         # Load in the molecule
         if smiles is None:
