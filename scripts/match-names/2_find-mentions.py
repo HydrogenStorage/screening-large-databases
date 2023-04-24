@@ -26,10 +26,12 @@ from parsl import Config, HighThroughputExecutor
 from parsl.addresses import address_by_hostname
 from parsl.launchers import AprunLauncher
 from parsl.providers import CobaltProvider
-from proxystore.store.remote import RemoteStore
+from proxystore.store.file import FileStore, FileStoreKey
+from proxystore.store.utils import get_key
 from pymongo.database import Database
 from pymongo import MongoClient
 import proxystore as ps
+import pandas as pd
 import numpy as np
 
 
@@ -135,7 +137,7 @@ class ScreenEngine(BaseThinker):
 
     def __init__(self,
                  queues: PipeQueues,
-                 store: RemoteStore,
+                 store: FileStore,
                  database: Database,
                  text_paths: List[Path],
                  subsets: List[str],
@@ -149,7 +151,7 @@ class ScreenEngine(BaseThinker):
         self.rec.reallocate(None, 'screen', 'all')
 
         # Store the input and output information
-        self.screen_paths = text_paths
+        self.screen_paths = sorted(text_paths)
         self.output_dir = output_dir
         self.molecules_per_task = molecules_per_task
         self.lines_per_task = lines_per_task
@@ -166,8 +168,13 @@ class ScreenEngine(BaseThinker):
         self.result_queue = Queue()
 
         # Tracking when we are done with a specific proxy
-        self.all_submitted: dict[str, Event] = {}  # Whether all molecules for this have been submitted
-        self.tasks_remaining: dict[str, int] = {}  # How many tasks for this file are left
+        self.proxy_key: Dict[str, FileStoreKey] = {}  # Key belonging to a proxy. Map of (filename, start line) to whatever ProxyStore uses
+        self.all_submitted: Dict[str, Event] = {}  # Whether all molecules for this have been submitted
+        self.tasks_remaining: Dict[str, int] = {}  # How many tasks for this file are left. Key: filename, start line
+        self.stores_remaining: Dict[str, int] = {}  # How many tasks for this file are left. Key: filename, start line
+
+        # Global tracking if we're done with a full file
+        self.completed_path = Path("files.complete")
 
         # Things to know if we are done
         self.all_read = Event()
@@ -184,21 +191,28 @@ class ScreenEngine(BaseThinker):
     def prepare_inputs(self):
         """Read chunks of molecules and text files to be screened"""
 
+        # Load in the list of file chunks which have been processed fully
+        if not self.completed_path.exists():
+            self.completed_path.write_text("filename,lines_per_task,start_line\n")
+            already_ran = []
+        else:
+            already_ran = pd.read_csv(self.completed_path).query(f'lines_per_task=={self.lines_per_task}').apply(tuple, axis=1)
+
         # Get a list of all the molecules we could run
         cursor = self.molecules.find({'subsets': {'$in': self.subsets}}, projection=['names'])
-        
+
         def yield_names(cursor):
             for record in cursor:
                 for name in record['names']:
                     self.total_molecule_names += 1
                     yield record['_id'], name
-                
+
         mol_batch_sizes = []
         to_match = []
         for batch_id, molecule_batch in enumerate(batched(yield_names(cursor), self.molecules_per_task)):
             mol_batch_sizes.append(len(molecule_batch))
-            to_match.append(self.store.proxy(molecule_batch, key=f'names-{batch_id}'))
-        
+            to_match.append(self.store.proxy(molecule_batch))
+
         self.logger.info(f'Prepared a list of {self.total_molecule_names} names to match to the text. '
                          f'Will run them in {len(to_match)} batches')
 
@@ -211,23 +225,30 @@ class ScreenEngine(BaseThinker):
                 for lines_id, lines in enumerate(batched(fp, self.lines_per_task)):
                     # Store which line this chunk starts at
                     start_line = lines_id * self.lines_per_task
+                    key = f'{filename.absolute()}-{start_line}'
+
+                    # Check if we've done everything already
+                    if (str(filename.absolute()), self.lines_per_task, start_line) in already_ran:
+                        self.logger.info(f'Already ran {filename} starting at {start_line}. Skipping')
 
                     # Proxy the section of file
-                    key = f'file-{file_id}-lines-{lines_id}'
-                    lines_proxy = self.store.proxy(lines, key=key)
+                    lines_proxy = self.store.proxy(lines)
 
                     # Prepare to track when we are done with it
+                    self.proxy_key[key] = get_key(lines_proxy)
                     self.all_submitted[key] = Event()
                     self.tasks_remaining[key] = 0
+                    self.stores_remaining[key] = 0
 
                     # Submit the molecules for this task
                     for mol_id, molecules in enumerate(to_match):
                         submitted_chunks += 1
                         n_pairs = len(lines) * mol_batch_sizes[mol_id]
                         self.total_pairs += n_pairs
-                        self.screen_queue.put((key, filename.name, start_line, n_pairs, lines_proxy, molecules))
+                        self.screen_queue.put((key, str(filename.absolute()), start_line, n_pairs, lines_proxy, molecules))
                         self.total_chunks += 1
                         self.tasks_remaining[key] += 1
+                        self.stores_remaining[key] += 1
 
                         # Check if we have submitted enough task to start
                         if self.total_chunks == self.queue_depth:
@@ -299,14 +320,15 @@ class ScreenEngine(BaseThinker):
                 self.tasks_remaining[chunk_key] -= 1
                 if self.tasks_remaining[chunk_key] == 0 and self.all_submitted[chunk_key].is_set():
                     self.logger.info(f'Done with all work on {chunk_key}. Evicting from store')
-                    self.store.evict(chunk_key)
+                    proxy_key = self.proxy_key.pop(chunk_key)
+                    self.store.evict(proxy_key)
 
                 # If unsuccessful, just skip this one
                 if not result.success:
                     self.logger.error(f'Task failed. Traceback: {result.failure_info.traceback}')
                 else:
                     # Push the result to be processed
-                    self.result_queue.put((result.task_info['filename'], result.task_info['start_line'], result.value))
+                    self.result_queue.put((chunk_key, result.task_info['filename'], result.task_info['start_line'], result.value))
 
                 # Print a status message
                 if self.all_read.is_set():
@@ -330,14 +352,14 @@ class ScreenEngine(BaseThinker):
         while not self.done.is_set():
             count += 1
             # Get the next chunk ready for processing
-            msg: Tuple[str, int, Dict[str, Tuple[str, int, str]]] = self.result_queue.get()
+            msg: Tuple[str, str, int, Dict[str, Tuple[str, int, str]]] = self.result_queue.get()
 
             # If it is `None` we are done
             if msg is None:
                 break
 
             # Otherwise, store results
-            filename, start_line, match_result = msg
+            chunk_key, filename, start_line, match_result = msg
             for key, matches in match_result.items():  # match_result is (inchi_key, match infomration)
                 self.total_matches += len(matches)
 
@@ -355,6 +377,13 @@ class ScreenEngine(BaseThinker):
                     self.mentions.update_one({'filename': filename, 'line': line_id},
                                              {'$addToSet': {'matches': {'$each': hits}},
                                               '$setOnInsert': {'text': texts[line_id]}}, upsert=True)
+
+            # Mark that we're done processing this result, and the whole file if we're done
+            self.stores_remaining[chunk_key] -= 1
+            if self.stores_remaining[chunk_key] == 0:
+                self.logger.info(f'Finished storing all results from {self.stores_remaining}. Writing it to disk')
+                with self.completed_path.open("a") as fp:
+                    print(f'{filename},{self.lines_per_task},{start_line}', file=fp)
 
             # Print a status message
             status = f'Found matches for {len(match_result)} molecules in {filename}. Total found: {self.total_matches}'
@@ -386,11 +415,11 @@ def find_matches(lines: List[str], names: List[Tuple[str, str]]) -> Dict[str, Li
     start_chars = ' ('
     end_chars = ' ).;,:'
     caps = list(product(start_chars, end_chars))
-    
+
     # Lower all names
     names_lower = [n.lower() for _, n in names]
-    
-     # Match the name as a full token. It must be preceded by a parenthesis, comma, space,
+
+    # Match the name as a full token. It must be preceded by a parenthesis, comma, space,
     #  and followed by a comma, period, parenthesis; unless it as the beginning or end of line
     for line_id, line in enumerate(lines):
         test_line = ' ' + line.lower() + ' '  # Pad with spaces, to simplify matching logic
@@ -398,6 +427,7 @@ def find_matches(lines: List[str], names: List[Tuple[str, str]]) -> Dict[str, Li
             if name_lower in test_line and any((s + name_lower + e) in test_line for s, e in caps):
                 output[key].append((name, line_id, line))
     return output
+
 
 if __name__ == '__main__':
     # User inputs
@@ -476,8 +506,7 @@ if __name__ == '__main__':
     if args.proxy_store == 'file':
         ps_file_dir = out_path / 'file-store'
         ps_file_dir.mkdir(exist_ok=True)
-        store = ps.store.init_store(
-            ps.store.STORES.FILE, name='file', store_dir=str(ps_file_dir))
+        store = FileStore(name='file', store_dir=str(ps_file_dir))
     else:
         raise ValueError('ProxyStore config not recognized: {}')
 
@@ -497,4 +526,4 @@ if __name__ == '__main__':
         queues.send_kill_signal()
 
     task_server.join()
-    store.cleanup()
+    store.close()

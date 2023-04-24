@@ -19,15 +19,15 @@ dependencies:
   - qcengine==0.18.*
   - rdkit==2021.09.4
   - py-cpuinfo<6
+  - xtb-python
   - mongodb==4.*
   - psutil
   - tqdm
 
 # Pip packages for all of them
   - pip:
-#      - -e . 
+      - -e . 
       - parsl[monitoring]>=1.*
       - mongoengine~=0.24
       - pydantic
-      - git+https://github.com/exalearn/colmena.git
-      - git+https://github.com/qmlcode/qml.git@develop
+      - colmena>=0.4.0
