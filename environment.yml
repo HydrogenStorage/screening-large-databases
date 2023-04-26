@@ -31,3 +31,5 @@ dependencies:
       - mongoengine~=0.24
       - pydantic
       - colmena>=0.4.0
+      - ase 
+      - more_itertools
