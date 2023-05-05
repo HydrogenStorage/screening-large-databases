@@ -26,6 +26,7 @@ from parsl import Config, HighThroughputExecutor
 from parsl.addresses import address_by_hostname
 from parsl.launchers import AprunLauncher
 from parsl.providers import CobaltProvider
+from proxystore.store import register_store
 from proxystore.store.file import FileStore, FileStoreKey
 from proxystore.store.utils import get_key
 from pymongo.database import Database
@@ -91,16 +92,16 @@ conda activate /lus/eagle/projects/ExaLearn/carbon-free-ldrd/env-cpu''',
                 cpu_affinity='block',
                 provider=CobaltProvider(
                     account='SuperBERT',
-                    nodes_per_block=900,
+                    nodes_per_block=128,
                     scheduler_options='#COBALT --attrs enable_ssh=1',
-                    walltime='20:00:00',
+                    walltime='3:00:00',
                     init_blocks=0,
                     max_blocks=1,
                     cmd_timeout=360,
                     launcher=AprunLauncher(overrides='-d 64 --cc depth -j 2'),
                     worker_init=f'''
 module load miniconda-3
-conda activate /lus/eagle/projects/ExaLearn/carbon-free-ldrd/env
+conda activate /lus/eagle/projects/ExaLearn/carbon-free-ldrd/env-cpu
 export PYTHONPATH="$PYTHONPATH:{Path(__file__).parent}"
 pwd 
 which python
@@ -108,7 +109,7 @@ which python
                 ),
             )],
             run_dir=run_path
-        ), 900 * 64 * 4
+        ), 128 * 64 * 4
     else:
         raise ValueError(f'Configuration not defined: {name}')
 
@@ -158,7 +159,8 @@ class ScreenEngine(BaseThinker):
         self.molecules = database['molecule_record']
         self.mentions = database['mention']
         self.store = store
-        self.subsets = list(subsets)
+        self.subsets = sorted(subsets)
+        self.subset_key = ":".join(subsets)
 
         # Queue to store ready-to-compute chunks
         self.queue_depth = slot_count * 3  # One in queue for each running already
@@ -193,10 +195,10 @@ class ScreenEngine(BaseThinker):
 
         # Load in the list of file chunks which have been processed fully
         if not self.completed_path.exists():
-            self.completed_path.write_text("filename,lines_per_task,start_line\n")
+            self.completed_path.write_text("filename,subsets,lines_per_task,start_line\n")
             already_ran = []
         else:
-            already_ran = pd.read_csv(self.completed_path).query(f'lines_per_task=={self.lines_per_task}').apply(tuple, axis=1)
+            already_ran = set(pd.read_csv(self.completed_path).query(f'lines_per_task=={self.lines_per_task}').apply(tuple, axis=1))
 
         # Get a list of all the molecules we could run
         cursor = self.molecules.find({'subsets': {'$in': self.subsets}}, projection=['names'])
@@ -228,8 +230,9 @@ class ScreenEngine(BaseThinker):
                     key = f'{filename.absolute()}-{start_line}'
 
                     # Check if we've done everything already
-                    if (str(filename.absolute()), self.lines_per_task, start_line) in already_ran:
+                    if (str(filename.absolute()), self.subset_key, self.lines_per_task, start_line) in already_ran:
                         self.logger.info(f'Already ran {filename} starting at {start_line}. Skipping')
+                        continue
 
                     # Proxy the section of file
                     lines_proxy = self.store.proxy(lines)
@@ -332,9 +335,9 @@ class ScreenEngine(BaseThinker):
 
                 # Print a status message
                 if self.all_read.is_set():
-                    self.logger.info(f'Received task {num_recorded}/{self.total_chunks}. Processing backlog: {self.result_queue.qsize()}')
+                    self.logger.info(f'Received task {num_recorded}/{self.total_chunks}. Runtime: {result.time_running:.2f}s. Processing backlog: {self.result_queue.qsize()}')
                 else:
-                    self.logger.info(f'Received task {num_recorded}/???. Processing backlog: {self.result_queue.qsize()}')
+                    self.logger.info(f'Received task {num_recorded}/???. Runtime: {result.time_running:.2f}s. Processing backlog: {self.result_queue.qsize()}')
 
         # Send a "done" message
         self.result_queue.put(None)
@@ -381,9 +384,9 @@ class ScreenEngine(BaseThinker):
             # Mark that we're done processing this result, and the whole file if we're done
             self.stores_remaining[chunk_key] -= 1
             if self.stores_remaining[chunk_key] == 0:
-                self.logger.info(f'Finished storing all results from {self.stores_remaining}. Writing it to disk')
+                self.logger.info(f'Finished storing all results from {chunk_key}. Writing it to disk')
                 with self.completed_path.open("a") as fp:
-                    print(f'{filename},{self.lines_per_task},{start_line}', file=fp)
+                    print(f'{filename},{self.subset_key},{self.lines_per_task},{start_line}', file=fp)
 
             # Print a status message
             status = f'Found matches for {len(match_result)} molecules in {filename}. Total found: {self.total_matches}'
@@ -475,7 +478,7 @@ if __name__ == '__main__':
     run_hash = sha256()
     run_hash.update(str(run_params).encode())
     subset_names = "_".join(args.subsets)
-    out_path = Path().joinpath('runs', f'matching-{subset_names}-mols-{run_hash.hexdigest()[:6]}')
+    out_path = Path().joinpath('runs', f'matching-{subset_names}-mols-{run_hash.hexdigest()[:6]}-{datetime.now().strftime("%d%b%y-%H%M%S")}')
     out_path.mkdir(parents=True, exist_ok=args.overwrite)
 
     # Store the run parameters
@@ -507,6 +510,7 @@ if __name__ == '__main__':
         ps_file_dir = out_path / 'file-store'
         ps_file_dir.mkdir(exist_ok=True)
         store = FileStore(name='file', store_dir=str(ps_file_dir))
+        register_store(store)
     else:
         raise ValueError('ProxyStore config not recognized: {}')
 
